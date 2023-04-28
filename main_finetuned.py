@@ -122,8 +122,11 @@ class PreloadedImagesDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        augmented_image = self.data_augmentation(self.images[idx])
-        return augmented_image, self.metadata[idx], self.labels[idx]
+        if self.data_augmentation is not None:
+            image = self.data_augmentation(self.images[idx])
+        else:
+            image = self.images[idx]
+        return image, self.metadata[idx], self.labels[idx]
 
 
 
@@ -196,14 +199,13 @@ def test(args, model, device, criterion, test_loader):
     y_pred = np.array(y_pred_list)
     y_pred_prob = np.array(y_pred_prob_list)
 
-    acc = accuracy(y_true, y_pred) 
+    # acc = accuracy(y_true, y_pred) * 100
     balanced_acc = balanced_accuracy(y_true, y_pred)
     category_auc = per_category_auc(y_true, y_pred_prob, num_classes=len(torch.unique(torch.tensor(y_true))))
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%) / ({:.0f}%), Balanced Accuracy: {:.4f}, AUC for each category: {}\n'.format(
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%), Balanced Accuracy: {:.4f}, AUC for each category: {}\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset),
-        acc,
         balanced_acc,
         category_auc
     ))
@@ -271,19 +273,6 @@ def preprocess(data_dir_path, metadata_csv_path, model_name=''):
     
     dataset.fill_missing_values_with_mean()
     dataset.normalize_age()
-    data_augmentation = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomChoice([
-                transforms.RandomRotation(0),
-                transforms.RandomRotation(90),
-                transforms.RandomRotation(180),
-                transforms.RandomRotation(270)
-            ]),
-            transforms.ColorJitter(brightness=(0.9, 1.1), contrast=(0.9, 1.1), saturation=(0.9, 1.1)),
-            transforms.ToTensor()
-        ])
-    dataset.data_augmentation = data_augmentation
     return dataset
 
 
@@ -326,7 +315,7 @@ def main():
         return
  
     if (not torch.cuda.is_available()):
-          raise OSError("Torch cannot find a cuda device")
+        raise OSError("Torch cannot find a cuda device")
     
     torch.manual_seed(args.seed)
 
@@ -338,10 +327,20 @@ def main():
    
     train_set = preprocess("training_set", "HAM10000_metadata.csv", model_name)
     test_set = preprocess("testing_set", "HAM10000_test_metadata.csv", model_name)
-    # Split the dataset into training and validation sets
-    # train_size = int(0.8 * len(dataset))
-    # valid_size = len(dataset) - train_size
-    # train_set, valid_set = random_split(dataset, [train_size, valid_size])
+
+    data_augmentation = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomChoice([
+            transforms.RandomRotation(0),
+            transforms.RandomRotation(90),
+            transforms.RandomRotation(180),
+            transforms.RandomRotation(270)
+        ]),
+        transforms.ColorJitter(brightness=(0.9, 1.1), contrast=(0.9, 1.1), saturation=(0.9, 1.1)),
+        transforms.ToTensor()
+    ])
+    # train_set.data_augmentation = data_augmentation
     num_samples_per_class = np.zeros(7)
     for label in train_set.labels:
         num_samples_per_class[label] += 1
@@ -349,49 +348,48 @@ def main():
     num_samples_per_class_inversed = 1 / num_samples_per_class
     weighted_arr = num_samples_per_class_inversed / np.sum(num_samples_per_class_inversed)
     weighted_tensor = torch.from_numpy(weighted_arr.astype('float32')).to(device)
+    print(weighted_tensor)
 
     # Create DataLoaders for training and validation sets
     train_loader = DataLoader(train_set, batch_size= args.batch_size, shuffle=True, **kwargs)
-    # valid_loader = DataLoader(valid_set, batch_size= args.batch_size, shuffle=False, **kwargs)
-
-    
     test_loader = DataLoader(test_set, batch_size=args.test_batch_size, shuffle=True, **kwargs)
 
-    # model = ModifiedResNet50(resnet50(weights=ResNet50_Weights.DEFAULT), 5).to(device)
+
+    if model_name == 'resnet-50':
+        weights = models.ResNet50_Weights.DEFAULT
+        model = ModifiedResNet(models.resnet50(weights=weights), weights.transforms(), 32)
+    elif model_name == 'resnet-152':
+        weights = models.ResNet152_Weights.DEFAULT
+        model = ModifiedResNet(models.resnet152(weights=weights), weights.transforms(), 32)
+    elif model_name == 'swin-b':
+        weights = models.Swin_V2_B_Weights.DEFAULT
+        model = ModifiedSwinTransformer(models.swin_v2_b(weights=weights), weights.transforms(), 32)
+    elif model_name == 'swin-s':
+        weights = models.Swin_V2_S_Weights.DEFAULT
+        model = ModifiedSwinTransformer(models.swin_v2_s(weights=weights), weights.transforms(), 32)
+    elif model_name == 'swin-t':
+        weights = models.Swin_V2_T_Weights.DEFAULT
+        model = ModifiedSwinTransformer(models.swin_v2_t(weights=weights), weights.transforms(), 32)
+    elif model_name == 'convnext-l':
+        weights = models.ConvNeXt_Large_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_large(weights=weights),  weights.transforms(), 32)
+    elif model_name == 'convnext-b':
+        weights = models.ConvNeXt_Base_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_base(weights=weights),  weights.transforms(), 32)
+    elif model_name == 'convnext-s':
+        weights = models.ConvNeXt_Small_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_small(weights=weights),  weights.transforms(), 32)
+    elif model_name == 'convnext-t':
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_tiny(weights=weights), weights.transforms(), 32)
+    else:
+        exit(1)
 
     saved_model_name = f"ham_{model_name}.pt"
     if os.path.exists(saved_model_name):
-        model = torch.load(saved_model_name)
-    else:
-        if model_name == 'resnet-50':
-            weights = models.ResNet50_Weights.DEFAULT
-            model = ModifiedResNet(models.resnet50(weights=weights), weights.transforms(), 32)
-        elif model_name == 'resnet-152':
-            weights = models.ResNet152_Weights.DEFAULT
-            model = ModifiedResNet(models.resnet152(weights=weights), weights.transforms(), 32)
-        elif model_name == 'swin-b':
-            weights = models.Swin_V2_B_Weights.DEFAULT
-            model = ModifiedSwinTransformer(models.swin_v2_b(weights=weights), weights.transforms(), 32)
-        elif model_name == 'swin-s':
-            weights = models.Swin_V2_S_Weights.DEFAULT
-            model = ModifiedSwinTransformer(models.swin_v2_s(weights=weights), weights.transforms(), 32)
-        elif model_name == 'swin-t':
-            weights = models.Swin_V2_T_Weights.DEFAULT
-            model = ModifiedSwinTransformer(models.swin_v2_t(weights=weights), weights.transforms(), 32)
-        elif model_name == 'convnext-l':
-            weights = models.ConvNeXt_Large_Weights.DEFAULT
-            model = ModifiedConvNext(models.convnext_large(weights=weights),  weights.transforms(), 32)
-        elif model_name == 'convnext-b':
-            weights = models.ConvNeXt_Base_Weights.DEFAULT
-            model = ModifiedConvNext(models.convnext_base(weights=weights),  weights.transforms(), 32)
-        elif model_name == 'convnext-s':
-            weights = models.ConvNeXt_Small_Weights.DEFAULT
-            model = ModifiedConvNext(models.convnext_small(weights=weights),  weights.transforms(), 32)
-        elif model_name == 'convnext-t':
-            weights = models.ConvNeXt_Tiny_Weights.DEFAULT
-            model = ModifiedConvNext(models.convnext_tiny(weights=weights), weights.transforms(), 32)
-        else:
-            exit(1)
+        saved_model_state = torch.load(saved_model_name)
+        model.load_state_dict(saved_model_state)
+        
 
     train_set.preprocess(model.transform)
     test_set.preprocess(model.transform)
@@ -399,8 +397,7 @@ def main():
     model = model.to(device)
     criterion = nn.CrossEntropyLoss(weight=weighted_tensor)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-
+    # scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
 
     last_train_loss = float('inf')
     best_test_loss = float('inf')
@@ -408,11 +405,11 @@ def main():
     test_loss_history = []
     convg_counter = 0
     overfit_counter = 0
-    patience = 15
+    patience = 90
     for epoch in range(1, args.epochs + 1):
         train_loss = train(args, model, device, train_loader, criterion, optimizer, epoch)
         test_loss = test(args, model, device, criterion, test_loader)
-        scheduler.step()
+        # scheduler.step()
         if abs(train_loss - last_train_loss) < 0.001:
             convg_counter += 1
         else:
@@ -428,7 +425,7 @@ def main():
         train_loss_history.append(train_loss)
         test_loss_history.append(test_loss)
         if convg_counter > patience or overfit_counter > patience:
-            print(f"Early stopping after {epoch} epochs")
+            print(f"Early stopping after {epoch} epochs, convg: {convg_counter}, overfit: {overfit_counter}")
             break
     print(train_loss_history)
     print(test_loss_history)
