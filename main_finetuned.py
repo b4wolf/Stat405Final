@@ -6,17 +6,19 @@ import random
 import argparse
 import torch.optim as optim
 import numpy as np
-import time
-
+import math
+import torch.nn.functional as F
 
 from torch.optim.lr_scheduler import StepLR
 from torchvision import transforms
-from torchvision.models import resnet50, resnet152, ResNet50_Weights, ResNet152_Weights, swin_v2_b, Swin_V2_B_Weights
+from torchvision import models
+from torchvision.models import resnet50, resnet152, ResNet50_Weights, ResNet152_Weights, swin_v2_b, Swin_V2_B_Weights, convnext_base, ConvNeXt_Base_Weights
 from torch.utils.data import Dataset, DataLoader, random_split
+
 from PIL import Image
 from sklearn.metrics import roc_auc_score
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # Functions to calculate accuracy and balanced accuracy
 def accuracy(y_true, y_pred):
     y_true = torch.tensor(y_true)
@@ -36,6 +38,7 @@ def balanced_accuracy(y_true, y_pred):
         pred_class = y_pred == i
         correct = torch.sum(true_class & pred_class).item()
         per_class_accuracies.append(correct / torch.sum(true_class).item())
+    print(per_class_accuracies)
 
     return sum(per_class_accuracies) / num_classes
 
@@ -53,34 +56,38 @@ def per_category_auc(y_true, y_pred_prob, num_classes):
 
     return auc_scores
 
-
-class ModifiedResNet152(nn.Module):
-    def __init__(self, resnet152, metadata_size):
-        super(ModifiedResNet152, self).__init__()
-        self.resnet152 = nn.Sequential(*list(resnet152.children())[:-1])
-        self.fc = nn.Linear(resnet152.fc.in_features + metadata_size, 7)
+class ModifiedNN(nn.Module):
+    def __init__(self):
+        super(ModifiedNN, self).__init__()
 
     def forward(self, x, metadata):
-        x = self.resnet152(x)
+        x = self.model(x)
         x = x.view(x.size(0), -1)
         x = torch.cat((x, metadata), dim=1)
         x = self.fc(x)
         return x
+    
+class ModifiedResNet(ModifiedNN):
+    def __init__(self, resnet, transform, metadata_size):
+        super(ModifiedResNet, self).__init__()
+        self.model = nn.Sequential(*list(resnet.children())[:-1])
+        self.fc = nn.Linear(resnet.fc.in_features + metadata_size, 7)
+        self.transform = transform
 
-class ModifiedSwinTransformer(nn.Module):
-    def __init__(self, swin_transformer, metadata_size):
+
+class ModifiedSwinTransformer(ModifiedNN):
+    def __init__(self, swin_transformer, transform, metadata_size):
         super(ModifiedSwinTransformer, self).__init__()
-        self.swin_transformer = nn.Sequential(*list(swin_transformer.children())[:-1])
+        self.model = nn.Sequential(*list(swin_transformer.children())[:-1])
         self.fc = nn.Linear(swin_transformer.head.in_features + metadata_size, 7)
+        self.transform = transform
 
-    def forward(self, x, metadata):
-        x = self.swin_transformer(x)
-        x = x.view(x.size(0), -1)
-        x = torch.cat((x, metadata), dim=1)
-        x = self.fc(x)
-        return x
-
-
+class ModifiedConvNext(ModifiedNN):
+    def __init__(self, convnext, transform, metadata_size):
+        super(ModifiedConvNext, self).__init__()
+        self.model = nn.Sequential(*list(convnext.children())[:-1])
+        self.fc = nn.Linear(convnext.classifier[-1].in_features + metadata_size, 7)
+        self.transform = transform
 
 # Define a custom dataset to handle images and metadata
 class PreloadedImagesDataset(Dataset):
@@ -88,24 +95,42 @@ class PreloadedImagesDataset(Dataset):
         self.images = images
         self.metadata = metadata
         self.labels = labels
+        self.data_augmentation = None
     
     def fill_missing_values_with_static(self, fill_value):
         metadata_arr = np.array(self.metadata, dtype=np.float32)
         metadata_arr[np.isnan(metadata_arr)] = fill_value
         self.metadata = metadata_arr
+    
+    def normalize_age(self):
+        age = self.metadata[:, 5]
+        self.metadata[:, 5] = age / 100
+    
+    def fill_missing_values_with_mean(self):
+        metadata_arr = np.array(self.metadata, dtype=np.float32)
+        self.metadata = metadata_arr
+        age = self.metadata[:, 5]
+        age_mean = np.nanmean(age)
+        age[np.isnan(age)] = age_mean
+        self.metadata[:, 5] = age
+
+    def preprocess(self, preprocess):
+        for idx, img in enumerate(self.images):
+            self.images[idx] = preprocess(img)
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        return self.images[idx], self.metadata[idx], self.labels[idx]
+        augmented_image = self.data_augmentation(self.images[idx])
+        return augmented_image, self.metadata[idx], self.labels[idx]
 
 
 
 def train(args, model, device, train_loader, criterion, optimizer, epoch):
     model.train()
     running_loss = 0.0
-    weight_dtype = model.resnet50[0].weight.dtype
+    weight_dtype = torch.float32
     for batch_idx, (data, metadata, target) in enumerate(train_loader):
         data, metadata, target = data.to(device, dtype=weight_dtype), metadata.to(device, dtype=weight_dtype), target.to(device)
         optimizer.zero_grad()
@@ -121,8 +146,10 @@ def train(args, model, device, train_loader, criterion, optimizer, epoch):
     
     # Calculate the average loss for this epoch
     epoch_loss = running_loss / len(train_loader)
-    print(f"Epoch {epoch + 1}/{args.epochs}, Loss: {epoch_loss:.4f}")
+    print(f"Epoch {epoch}/{args.epochs}, Loss: {epoch_loss:.4f}")
 
+
+    return epoch_loss
     # # Evaluate the model on the validation set
     # model.eval()
     # valid_loss = 0.0
@@ -139,25 +166,6 @@ def train(args, model, device, train_loader, criterion, optimizer, epoch):
     #     print(f"Validation Loss: {valid_loss:.4f}")
 
 
-def test_old(args, model, device, criterion, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    weight_dtype = model.resnet50[0].weight.dtype
-    with torch.no_grad():
-        for data, metadata, target in test_loader:
-            data, metadata, target = data.to(device, dtype=weight_dtype), metadata.to(device, dtype=weight_dtype), target.to(device)
-            output = model(data, metadata)
-            test_loss += criterion(output, target).item() # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-
-    test_loss /= len(test_loader.dataset)
-
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
-
 def test(args, model, device, criterion, test_loader):
     model.eval()
     test_loss = 0
@@ -166,7 +174,7 @@ def test(args, model, device, criterion, test_loader):
     y_true_list = []
     y_pred_list = []
     y_pred_prob_list = []
-    weight_dtype = model.resnet50[0].weight.dtype
+    weight_dtype = torch.float32
     with torch.no_grad():
         for data, metadata, target in test_loader:
             data, metadata, target = data.to(device, dtype=weight_dtype), metadata.to(device, dtype=weight_dtype), target.to(device)
@@ -182,35 +190,32 @@ def test(args, model, device, criterion, test_loader):
             y_pred_list.extend(pred.squeeze().cpu().numpy())
             y_pred_prob_list.extend(pred_prob.cpu().numpy())
 
-    test_loss /= len(test_loader.dataset)
+    test_loss /= len(test_loader)
 
     y_true = np.array(y_true_list)
     y_pred = np.array(y_pred_list)
     y_pred_prob = np.array(y_pred_prob_list)
 
-    acc = accuracy(y_true, y_pred)
+    acc = accuracy(y_true, y_pred) 
     balanced_acc = balanced_accuracy(y_true, y_pred)
     category_auc = per_category_auc(y_true, y_pred_prob, num_classes=len(torch.unique(torch.tensor(y_true))))
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%), Balanced Accuracy: {:.4f}, AUC for each category: {}\n'.format(
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%) / ({:.0f}%), Balanced Accuracy: {:.4f}, AUC for each category: {}\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset),
+        acc,
         balanced_acc,
         category_auc
     ))
 
+    return test_loss
 
-def preprocess(data_dir_path, metadata_csv_path, model_name):
-    saved_preprocessed_data_name = f"{data_dir_path}_{model_name}.pt"
-    if os.path.exists(saved_preprocessed_data_name):
-        dataset = torch.load(saved_preprocessed_data_name)
+
+def preprocess(data_dir_path, metadata_csv_path, model_name=''):
+    saved_image_data_name = f"{data_dir_path}.pt"
+    if os.path.exists(saved_image_data_name):
+        dataset = torch.load(saved_image_data_name)
     else:   
-        if model_name == 'resnet-152':
-            preprocess = ResNet50_Weights.DEFAULT.transforms()
-        elif model_name == 'swin':
-            preprocess = Swin_V2_B_Weights.DEFAULT.transforms()
-        # Read the metadata CSV file
-        # metadata_csv_path = 'HAM10000_metadata.csv'
         metadata_df = pd.read_csv(metadata_csv_path)
 
         metadata_df = metadata_df[['image_id', 'dx', 'dx_type', 'age', 'sex', 'localization', 'dataset']]
@@ -239,18 +244,46 @@ def preprocess(data_dir_path, metadata_csv_path, model_name):
                 image_id = os.path.splitext(image_filename)[0]
                 image_path = os.path.join(data_dir_path, image_filename)
                 image = Image.open(image_path).convert('RGB')
-                image_list.append(preprocess(image))
+                image_list.append(image)
                 metadata = metadata_dict.get(image_id)
-                metadata_list.append(metadata[1:])
+
+                metadata_one_hot = []
+
+                for meta_idx, x in enumerate(metadata[1:]):
+                    if meta_idx != 1:
+                        class_num = len(mapping_list[2+meta_idx])
+                        if math.isnan(x):
+                            x = class_num
+                        one_hot_expression = F.one_hot(torch.tensor([x]), num_classes=class_num + 1).tolist()
+                        metadata_one_hot.extend(one_hot_expression[0])
+                    else:
+                        metadata_one_hot.append(x)
+
+                metadata_list.append(metadata_one_hot)
                 label_list.append(metadata[0])
                 if idx % 1000 == 0:
                     print(f"loaded {idx} images")
-    
 
         # Create custom dataset and dataloader
         dataset = PreloadedImagesDataset(image_list, metadata_list, label_list)
-        torch.save(dataset, saved_preprocessed_data_name)      
-    dataset.fill_missing_values_with_static(-1)
+        torch.save(dataset, saved_image_data_name)      
+
+    
+    dataset.fill_missing_values_with_mean()
+    dataset.normalize_age()
+    data_augmentation = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomChoice([
+                transforms.RandomRotation(0),
+                transforms.RandomRotation(90),
+                transforms.RandomRotation(180),
+                transforms.RandomRotation(270)
+            ]),
+            transforms.ColorJitter(brightness=(0.9, 1.1), contrast=(0.9, 1.1), saturation=(0.9, 1.1)),
+            transforms.ToTensor()
+        ])
+    dataset.data_augmentation = data_augmentation
     return dataset
 
 
@@ -272,6 +305,10 @@ def main():
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
     
+    parser.add_argument('--mode', type=str, default='all', metavar='MO', help='what is the mode to run this script? <all|preprocess>')
+    
+    parser.add_argument('--dataset', type=str, default='')
+
     parser.add_argument('--model', type=str, default='resnet-152', metavar='MD',
                         help='Which model to train')
     
@@ -280,9 +317,16 @@ def main():
     
     
     args = parser.parse_args()
+    if args.mode == 'preprocess':
+        if args.dataset.startswith('training_set'):
+            preprocess(args.dataset, "HAM10000_metadata.csv", model_name='')
+        elif args.dataset.startswith('testing_set'):
+            preprocess(args.dataset, "HAM10000_test_metadata.csv", model_name='')
 
+        return
+ 
     if (not torch.cuda.is_available()):
-         raise OSError("Torch cannot find a cuda device")
+          raise OSError("Torch cannot find a cuda device")
     
     torch.manual_seed(args.seed)
 
@@ -291,17 +335,26 @@ def main():
 
     kwargs = {'num_workers': 0, 'pin_memory': True} if use_cuda else {}
     model_name = args.model
+   
     train_set = preprocess("training_set", "HAM10000_metadata.csv", model_name)
+    test_set = preprocess("testing_set", "HAM10000_test_metadata.csv", model_name)
     # Split the dataset into training and validation sets
     # train_size = int(0.8 * len(dataset))
     # valid_size = len(dataset) - train_size
     # train_set, valid_set = random_split(dataset, [train_size, valid_size])
+    num_samples_per_class = np.zeros(7)
+    for label in train_set.labels:
+        num_samples_per_class[label] += 1
+    
+    num_samples_per_class_inversed = 1 / num_samples_per_class
+    weighted_arr = num_samples_per_class_inversed / np.sum(num_samples_per_class_inversed)
+    weighted_tensor = torch.from_numpy(weighted_arr.astype('float32')).to(device)
 
     # Create DataLoaders for training and validation sets
     train_loader = DataLoader(train_set, batch_size= args.batch_size, shuffle=True, **kwargs)
     # valid_loader = DataLoader(valid_set, batch_size= args.batch_size, shuffle=False, **kwargs)
 
-    test_set = preprocess("test_data", "HAM10000_test_metadata.csv", model_name)
+    
     test_loader = DataLoader(test_set, batch_size=args.test_batch_size, shuffle=True, **kwargs)
 
     # model = ModifiedResNet50(resnet50(weights=ResNet50_Weights.DEFAULT), 5).to(device)
@@ -310,23 +363,75 @@ def main():
     if os.path.exists(saved_model_name):
         model = torch.load(saved_model_name)
     else:
-        if model_name == 'resnet-152':
-            model = ModifiedResNet152(resnet152(weights=ResNet152_Weights.DEFAULT), 5)
-        elif model_name == 'swin':
-            model = ModifiedSwinTransformer(swin_v2_b(weights=Swin_V2_B_Weights.DEFAULT), 5)
+        if model_name == 'resnet-50':
+            weights = models.ResNet50_Weights.DEFAULT
+            model = ModifiedResNet(models.resnet50(weights=weights), weights.transforms(), 32)
+        elif model_name == 'resnet-152':
+            weights = models.ResNet152_Weights.DEFAULT
+            model = ModifiedResNet(models.resnet152(weights=weights), weights.transforms(), 32)
+        elif model_name == 'swin-b':
+            weights = models.Swin_V2_B_Weights.DEFAULT
+            model = ModifiedSwinTransformer(models.swin_v2_b(weights=weights), weights.transforms(), 32)
+        elif model_name == 'swin-s':
+            weights = models.Swin_V2_S_Weights.DEFAULT
+            model = ModifiedSwinTransformer(models.swin_v2_s(weights=weights), weights.transforms(), 32)
+        elif model_name == 'swin-t':
+            weights = models.Swin_V2_T_Weights.DEFAULT
+            model = ModifiedSwinTransformer(models.swin_v2_t(weights=weights), weights.transforms(), 32)
+        elif model_name == 'convnext-l':
+            weights = models.ConvNeXt_Large_Weights.DEFAULT
+            model = ModifiedConvNext(models.convnext_large(weights=weights),  weights.transforms(), 32)
+        elif model_name == 'convnext-b':
+            weights = models.ConvNeXt_Base_Weights.DEFAULT
+            model = ModifiedConvNext(models.convnext_base(weights=weights),  weights.transforms(), 32)
+        elif model_name == 'convnext-s':
+            weights = models.ConvNeXt_Small_Weights.DEFAULT
+            model = ModifiedConvNext(models.convnext_small(weights=weights),  weights.transforms(), 32)
+        elif model_name == 'convnext-t':
+            weights = models.ConvNeXt_Tiny_Weights.DEFAULT
+            model = ModifiedConvNext(models.convnext_tiny(weights=weights), weights.transforms(), 32)
+        else:
+            exit(1)
+
+    train_set.preprocess(model.transform)
+    test_set.preprocess(model.transform)
     
-    model.to(device)
-    criterion = nn.CrossEntropyLoss()
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss(weight=weighted_tensor)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
-    scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
 
+
+    last_train_loss = float('inf')
+    best_test_loss = float('inf')
+    train_loss_history = []
+    test_loss_history = []
+    convg_counter = 0
+    overfit_counter = 0
+    patience = 15
     for epoch in range(1, args.epochs + 1):
-        train(args, model, device, train_loader, criterion, optimizer, epoch)
-        test(args, model, device, criterion, test_loader)
+        train_loss = train(args, model, device, train_loader, criterion, optimizer, epoch)
+        test_loss = test(args, model, device, criterion, test_loader)
         scheduler.step()
-
-        if epoch % 5 == 0 and (args.save_model):
+        if abs(train_loss - last_train_loss) < 0.001:
+            convg_counter += 1
+        else:
+            convg_counter = 0
+        last_train_loss = train_loss
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
             torch.save(model.state_dict(), saved_model_name)
+            overfit_counter = 0
+        else:
+            overfit_counter += 1
+        
+        train_loss_history.append(train_loss)
+        test_loss_history.append(test_loss)
+        if convg_counter > patience or overfit_counter > patience:
+            print(f"Early stopping after {epoch} epochs")
+            break
+    print(train_loss_history)
+    print(test_loss_history)
 
 if __name__ == '__main__':
     main()
