@@ -33,4 +33,4 @@ conda list
 
 # Modify these lines to run your desired Python script
 python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'PyTorch CUDA version: {torch.version.cuda}'); print(f'CUDA device: {torch.cuda.get_device_name(0)}')"
-python main_finetuned.py --save-model --epochs 100 --lr 0.001 --momentum 0.9 --test-batch-size 64 
+python main.py --save-model --epochs 120 --lr 0.001 --momentum 0.9 --test-batch-size 64 --model $1

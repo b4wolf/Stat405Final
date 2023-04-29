@@ -6,15 +6,18 @@ import random
 import argparse
 import torch.optim as optim
 import numpy as np
+import math
+import torch.nn.functional as F
 
-
+from torch.optim.lr_scheduler import StepLR
 from torchvision import transforms
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision import models
+from torchvision.models import resnet50, resnet152, ResNet50_Weights, ResNet152_Weights, swin_v2_b, Swin_V2_B_Weights, convnext_base, ConvNeXt_Base_Weights
 from torch.utils.data import Dataset, DataLoader, random_split
+
 from PIL import Image
 from sklearn.metrics import roc_auc_score
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # Functions to calculate accuracy and balanced accuracy
 def accuracy(y_true, y_pred):
     y_true = torch.tensor(y_true)
@@ -34,6 +37,7 @@ def balanced_accuracy(y_true, y_pred):
         pred_class = y_pred == i
         correct = torch.sum(true_class & pred_class).item()
         per_class_accuracies.append(correct / torch.sum(true_class).item())
+    print(per_class_accuracies)
 
     return sum(per_class_accuracies) / num_classes
 
@@ -51,48 +55,88 @@ def per_category_auc(y_true, y_pred_prob, num_classes):
 
     return auc_scores
 
+class ModifiedNN(nn.Module):
+    def __init__(self):
+        super(ModifiedNN, self).__init__()
+
+    def forward(self, x, metadata):
+        x = self.model(x)
+        x = x.view(x.size(0), -1)
+        x = torch.cat((x, metadata), dim=1)
+        x = self.fc(x)
+        return x
+    
+class ModifiedResNet(ModifiedNN):
+    def __init__(self, resnet, transform, metadata_size):
+        super(ModifiedResNet, self).__init__()
+        self.model = nn.Sequential(*list(resnet.children())[:-1])
+        self.fc = nn.Linear(resnet.fc.in_features + metadata_size, 7)
+        self.transform = transform
+
+
+class ModifiedSwinTransformer(ModifiedNN):
+    def __init__(self, swin_transformer, transform, metadata_size):
+        super(ModifiedSwinTransformer, self).__init__()
+        self.model = nn.Sequential(*list(swin_transformer.children())[:-1])
+        self.fc = nn.Linear(swin_transformer.head.in_features + metadata_size, 7)
+        self.transform = transform
+
+class ModifiedConvNext(ModifiedNN):
+    def __init__(self, convnext, transform, metadata_size):
+        super(ModifiedConvNext, self).__init__()
+        self.model = nn.Sequential(*list(convnext.children())[:-1])
+        self.fc = nn.Linear(convnext.classifier[-1].in_features + metadata_size, 7)
+        self.transform = transform
 
 # Define a custom dataset to handle images and metadata
-class CustomDataset(Dataset):
-    def __init__(self, image_paths, metadata, preprocess=None):
-        self.image_paths = image_paths
+class PreloadedImagesDataset(Dataset):
+    def __init__(self, images, metadata, labels):
+        self.images = images
         self.metadata = metadata
-        self.preprocess = preprocess
+        self.labels = labels
+        self.data_augmentation = None
+    
+    def fill_missing_values_with_static(self, fill_value):
+        metadata_arr = np.array(self.metadata, dtype=np.float32)
+        metadata_arr[np.isnan(metadata_arr)] = fill_value
+        self.metadata = metadata_arr
+    
+    def normalize_age(self):
+        age = self.metadata[:, 5]
+        self.metadata[:, 5] = age / 100
+    
+    def fill_missing_values_with_mean(self):
+        metadata_arr = np.array(self.metadata, dtype=np.float32)
+        self.metadata = metadata_arr
+        age = self.metadata[:, 5]
+        age_mean = np.nanmean(age)
+        age[np.isnan(age)] = age_mean
+        self.metadata[:, 5] = age
+
+    def preprocess(self, preprocess):
+        for idx, img in enumerate(self.images):
+            self.images[idx] = preprocess(img)
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.images)
 
     def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert('RGB')
-        if self.preprocess:
-            image = self.preprocess(image)
-        return image, self.metadata[idx]
+        if self.data_augmentation is not None:
+            image = self.data_augmentation(self.images[idx])
+        else:
+            image = self.images[idx]
+        return image, self.metadata[idx], self.labels[idx]
 
 
-class MyDataset(Dataset):
-    def __init__(self, combined_features_tensor, labels_list):
-        self.data = combined_features_tensor
-        self.label = labels_list
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        data = self.data[idx]
-        label = self.label[idx]
-
-        return data, label
-
-
-def train(args, model, device, train_loader, valid_loader, criterion,optimizer, epoch):
+def train(args, model, device, train_loader, criterion, optimizer, epoch):
     model.train()
     running_loss = 0.0
-    weight_dtype = model.weight.dtype
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
+    weight_dtype = torch.float32
+    for batch_idx, (data, metadata, target) in enumerate(train_loader):
+        data, metadata, target = data.to(device, dtype=weight_dtype), metadata.to(device, dtype=weight_dtype), target.to(device)
         optimizer.zero_grad()
-        data = data.to(device, dtype=weight_dtype)
-        output = model(data)
+        output = model(data, metadata)
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
@@ -104,44 +148,13 @@ def train(args, model, device, train_loader, valid_loader, criterion,optimizer, 
     
     # Calculate the average loss for this epoch
     epoch_loss = running_loss / len(train_loader)
-    print(f"Epoch {epoch + 1}/{args.epochs}, Loss: {epoch_loss:.4f}")
+    print(f"Epoch {epoch}/{args.epochs}, Loss: {epoch_loss:.4f}")
 
-    # Evaluate the model on the validation set
-    model.eval()
-    valid_loss = 0.0
-    with torch.no_grad():
-        for inputs, labels in valid_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            inputs = inputs.to(device, dtype=weight_dtype)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
 
-            valid_loss += loss.item()
-
-        valid_loss = valid_loss / len(valid_loader)
-        print(f"Validation Loss: {valid_loss:.4f}")
+    return epoch_loss
 
 
 def test(args, model, device, criterion, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    weight_dtype = model.weight.dtype
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device, dtype=weight_dtype), target.to(device)
-            output = model(data)
-            test_loss += criterion(output, target).item() # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True) # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
-
-    test_loss /= len(test_loader.dataset)
-
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
-
-def test_old(args, model, device, criterion, test_loader):
     model.eval()
     test_loss = 0
     correct = 0
@@ -149,12 +162,11 @@ def test_old(args, model, device, criterion, test_loader):
     y_true_list = []
     y_pred_list = []
     y_pred_prob_list = []
-    weight_dtype = model.weight.dtype
+    weight_dtype = torch.float32
     with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            data = data.to(device, dtype=weight_dtype)
-            output = model(data)
+        for data, metadata, target in test_loader:
+            data, metadata, target = data.to(device, dtype=weight_dtype), metadata.to(device, dtype=weight_dtype), target.to(device)
+            output = model(data, metadata)
             test_loss += criterion(output, target).item()  # sum up batch loss
 
             pred_prob = torch.softmax(output, dim=1)  # get the predicted probabilities
@@ -166,13 +178,13 @@ def test_old(args, model, device, criterion, test_loader):
             y_pred_list.extend(pred.squeeze().cpu().numpy())
             y_pred_prob_list.extend(pred_prob.cpu().numpy())
 
-    test_loss /= len(test_loader.dataset)
+    test_loss /= len(test_loader)
 
     y_true = np.array(y_true_list)
     y_pred = np.array(y_pred_list)
     y_pred_prob = np.array(y_pred_prob_list)
 
-    acc = accuracy(y_true, y_pred)
+    # acc = accuracy(y_true, y_pred) * 100
     balanced_acc = balanced_accuracy(y_true, y_pred)
     category_auc = per_category_auc(y_true, y_pred_prob, num_classes=len(torch.unique(torch.tensor(y_true))))
 
@@ -183,48 +195,14 @@ def test_old(args, model, device, criterion, test_loader):
         category_auc
     ))
 
+    return test_loss, balanced_acc
 
-def fill_dataset_nan_with_mean(dataset):
-    # Find the dimensions of the dataset
-    num_samples = len(dataset)
-    num_features = dataset[0][0].shape[0]
 
-    # Collect all feature values and create a mask for NaN values
-    all_features = torch.empty((num_samples, num_features))
-    nan_mask = torch.empty((num_samples, num_features), dtype=torch.bool)
-
-    for i, (data, _) in enumerate(dataset):
-        all_features[i] = data
-        nan_mask[i] = torch.isnan(data)
-
-    # Calculate the mean of each feature without considering NaN values
-    mean_vals = torch.nanmean(all_features, dim=0)
-
-    # Fill the NaN values with the corresponding mean values for each feature
-    for i in range(num_features):
-        all_features[:, i].masked_fill_(nan_mask[:, i], mean_vals[i])
-
-    # Update the dataset with the new feature values
-    for i, (data, target) in enumerate(dataset):
-        dataset.data[i] = all_features[i]
-
-def preprocess(device, data_dir_path, metadata_csv_path):
-    if os.path.exists(f"{data_dir_path}.pt"):
-        mydataset = torch.load(f"{data_dir_path}.pt")
-    else:
-        # Load pre-trained CNN model
-        weights = ResNet50_Weights.DEFAULT
-        preprocess = weights.transforms()
-        model = resnet50(weights=ResNet50_Weights.DEFAULT)
-
-        # Remove the fully connected layer
-        model = nn.Sequential(*list(model.children())[:-1])
-        model = model.to(device)
-        metadata_list = []
-        image_paths = []
-
-        # Read the metadata CSV file
-        # metadata_csv_path = 'HAM10000_metadata.csv'
+def preprocess(data_dir_path, metadata_csv_path, model_name=''):
+    saved_image_data_name = f"{data_dir_path}.pt"
+    if os.path.exists(saved_image_data_name):
+        dataset = torch.load(saved_image_data_name)
+    else:   
         metadata_df = pd.read_csv(metadata_csv_path)
 
         metadata_df = metadata_df[['image_id', 'dx', 'dx_type', 'age', 'sex', 'localization', 'dataset']]
@@ -246,43 +224,41 @@ def preprocess(device, data_dir_path, metadata_csv_path):
         metadata_int = list(zip(*mapped_metadata_transposed))
         metadata_dict = {row[0]: row[1:] for row in metadata_int}
         label_list = []
-        for image_filename in os.listdir(data_dir_path):
+        image_list = []
+        metadata_list = []
+        for idx, image_filename in enumerate(os.listdir(data_dir_path)):
             if image_filename.startswith("ISIC"):
                 image_id = os.path.splitext(image_filename)[0]
-                image_paths.append(os.path.join(data_dir_path, image_filename))
+                image_path = os.path.join(data_dir_path, image_filename)
+                image = Image.open(image_path).convert('RGB')
+                image_list.append(image)
                 metadata = metadata_dict.get(image_id)
-                metadata_list.append(metadata[1:])
+
+                metadata_one_hot = []
+
+                for meta_idx, x in enumerate(metadata[1:]):
+                    if meta_idx != 1:
+                        class_num = len(mapping_list[2+meta_idx])
+                        if math.isnan(x):
+                            x = class_num
+                        one_hot_expression = F.one_hot(torch.tensor([x]), num_classes=class_num + 1).tolist()
+                        metadata_one_hot.extend(one_hot_expression[0])
+                    else:
+                        metadata_one_hot.append(x)
+
+                metadata_list.append(metadata_one_hot)
                 label_list.append(metadata[0])
-        
+                if idx % 1000 == 0:
+                    print(f"loaded {idx} images")
 
         # Create custom dataset and dataloader
-        dataset = CustomDataset(image_paths, metadata_list, preprocess)
-        dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=4)
+        dataset = PreloadedImagesDataset(image_list, metadata_list, label_list)
+        torch.save(dataset, saved_image_data_name)      
 
-        # Extract feature vectors and concatenate metadata
-        combined_features_list = []
-        for images, metadata in dataloader:
-            images = images.to(device)
-            with torch.no_grad():
-                image_features = model(images)
-                image_features = image_features.view(image_features.size(0), -1) # Flatten features
-
-            metadata_tensor = torch.stack(metadata, dim=1).to(device)
-            combined_features = torch.cat([image_features, metadata_tensor], dim=1)
-            combined_features_list.append(combined_features)
-
-            
-        combined_features_tensor = torch.cat(combined_features_list, dim=0)
-        mydataset = MyDataset(combined_features_tensor, label_list)
-
-        torch.save(mydataset, f'{data_dir_path}.pt')
     
-    fill_dataset_nan_with_mean(mydataset)
-    print("Loaded data")
-    # print(mydataset.data)
-    return mydataset
-
-
+    dataset.fill_missing_values_with_mean()
+    dataset.normalize_age()
+    return dataset
 
 
 def main():
@@ -303,47 +279,153 @@ def main():
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
     
+    parser.add_argument('--mode', type=str, default='all', metavar='MO', help='what is the mode to run this script? <all|preprocess>')
+    
+    parser.add_argument('--dataset', type=str, default='')
+
+    parser.add_argument('--model', type=str, default='resnet-152', metavar='MD',
+                        help='Which model to train')
+    
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
+    
+    
     args = parser.parse_args()
+    if args.mode == 'preprocess':
+        if args.dataset.startswith('training_set'):
+            preprocess(args.dataset, "HAM10000_metadata.csv", model_name='')
+        elif args.dataset.startswith('testing_set'):
+            preprocess(args.dataset, "HAM10000_test_metadata.csv", model_name='')
 
+        return
+ 
     if (not torch.cuda.is_available()):
-         raise OSError("Torch cannot find a cuda device")
+        raise OSError("Torch cannot find a cuda device")
     
     torch.manual_seed(args.seed)
 
     use_cuda = True
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
+    kwargs = {'num_workers': 0, 'pin_memory': True} if use_cuda else {}
+    model_name = args.model
+    train_set = preprocess("training_set", "HAM10000_metadata.csv", model_name)
+    test_set = preprocess("testing_set", "HAM10000_test_metadata.csv", model_name)
 
-    dataset = preprocess(device, "training_set", "HAM10000_metadata.csv")
-    # Split the dataset into training and validation sets
-    train_size = int(0.8 * len(dataset))
-    valid_size = len(dataset) - train_size
-    train_set, valid_set = random_split(dataset, [train_size, valid_size])
+
+    data_augmentation = transforms.Compose([
+        transforms.Resize((600, int(400 * 1.25))),
+        transforms.RandomResizedCrop(
+            size=224,
+            scale=(0.8, 1.0),
+            ratio=(1.0, 1.0)
+        ),
+        transforms.RandomChoice([
+            transforms.RandomRotation(0),
+            transforms.RandomRotation(90),
+            transforms.RandomRotation(180),
+            transforms.RandomRotation(270)
+        ]),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=(0.9, 1.1), contrast=(0.9, 1.1), saturation=(0.9, 1.1)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.7635, 0.5461, 0.5705], std=[0.0896, 0.1183, 0.1330]),
+    ])
+    train_set.data_augmentation = data_augmentation
+    test_set_preprocess = transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.7635, 0.5461, 0.5705], std=[0.0896, 0.1183, 0.1330]),
+    ])
+    test_set.preprocess(test_set_preprocess)
+    
+    num_samples_per_class = np.zeros(7)
+    for label in train_set.labels:
+        num_samples_per_class[label] += 1
+    
+    num_samples_per_class_inversed = 1 / num_samples_per_class
+    weighted_arr = num_samples_per_class_inversed / np.sum(num_samples_per_class_inversed)
+    weighted_tensor = torch.from_numpy(weighted_arr.astype('float32')).to(device)
 
     # Create DataLoaders for training and validation sets
-    train_loader = DataLoader(train_set, batch_size= args.batch_size, shuffle=True, num_workers=0)
-    valid_loader = DataLoader(valid_set, batch_size= args.batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_set, batch_size= args.batch_size, shuffle=True, **kwargs)
+    test_loader = DataLoader(test_set, batch_size=args.test_batch_size, shuffle=True, **kwargs)
 
-    test_dataset = preprocess(device, "test_data", "HAM10000_test_metadata.csv")
-    test_loader = DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=True, num_workers=0)
+    if model_name == 'resnet-50':
+        weights = models.ResNet50_Weights.DEFAULT
+        model = ModifiedResNet(models.resnet50(weights=weights), weights.transforms(), 32)
+    elif model_name == 'resnet-152':
+        weights = models.ResNet152_Weights.DEFAULT
+        model = ModifiedResNet(models.resnet152(weights=weights), weights.transforms(), 32)
+    elif model_name == 'swin-b':
+        weights = models.Swin_V2_B_Weights.DEFAULT
+        model = ModifiedSwinTransformer(models.swin_v2_b(weights=weights), weights.transforms(), 32)
+    elif model_name == 'swin-s':
+        weights = models.Swin_V2_S_Weights.DEFAULT
+        model = ModifiedSwinTransformer(models.swin_v2_s(weights=weights), weights.transforms(), 32)
+    elif model_name == 'swin-t':
+        weights = models.Swin_V2_T_Weights.DEFAULT
+        model = ModifiedSwinTransformer(models.swin_v2_t(weights=weights), weights.transforms(), 32)
+    elif model_name == 'convnext-l':
+        weights = models.ConvNeXt_Large_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_large(weights=weights),  weights.transforms(), 32)
+    elif model_name == 'convnext-b':
+        weights = models.ConvNeXt_Base_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_base(weights=weights),  weights.transforms(), 32)
+    elif model_name == 'convnext-s':
+        weights = models.ConvNeXt_Small_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_small(weights=weights),  weights.transforms(), 32)
+    elif model_name == 'convnext-t':
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT
+        model = ModifiedConvNext(models.convnext_tiny(weights=weights), weights.transforms(), 32)
+    else:
+        exit(1)
 
-    output_size = 7 # Number of output classes
-    input_size = 2053
-    fc_layer = nn.Linear(input_size, output_size).to(device)
-    model = fc_layer.to(device)
-    # model = Net().to(device)
-    criterion = nn.CrossEntropyLoss()
+    saved_model_name = f"ham_{model_name}.pt"
+    if os.path.exists(saved_model_name):
+        saved_model_state = torch.load(saved_model_name)
+        model.load_state_dict(saved_model_state)
+        
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss(weight=weighted_tensor)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
 
+
+    test_loss, mean_recall = test(args, model, device, criterion, test_loader)
+    last_train_loss = float('inf')
+    best_mean_recall = mean_recall
+    train_loss_history = []
+    test_loss_history = []
+    mean_recall_history = []
+    convg_counter = 0
+    overfit_counter = 0
+    patience = 60
     for epoch in range(1, args.epochs + 1):
-        train(args, model, device, train_loader, valid_loader, criterion, optimizer, epoch)
-        test(args, model, device, criterion, test_loader)
-
-    if (args.save_model):
-        torch.save(model.state_dict(), "ham.pt")
+        train_loss = train(args, model, device, train_loader, criterion, optimizer, epoch)
+        test_loss, mean_recall = test(args, model, device, criterion, test_loader)
+        scheduler.step()
+        if abs(train_loss - last_train_loss) < 0.001:
+            convg_counter += 1
+        else:
+            convg_counter = 0
+        last_train_loss = train_loss
+        if mean_recall > best_mean_recall:
+            best_mean_recall = mean_recall
+            torch.save(model.state_dict(), saved_model_name)
+            overfit_counter = 0
+        else:
+            overfit_counter += 1
+        
+        train_loss_history.append(train_loss)
+        test_loss_history.append(test_loss)
+        mean_recall_history.append(mean_recall)
+        if convg_counter > patience or overfit_counter > patience:
+            print(f"Early stopping after {epoch} epochs, convg: {convg_counter}, overfit: {overfit_counter}")
+            break
+    print(train_loss_history)
+    print(test_loss_history)
+    print(mean_recall_history)
 
 if __name__ == '__main__':
     main()

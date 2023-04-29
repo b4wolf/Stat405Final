@@ -3,9 +3,12 @@ import torch
 import sys
 import os
 import torch.nn as nn
+import json
+import hashlib
 from torchvision import transforms
 from torchvision import models
-from sklearn.metrics import confusion_matrix, recall_score, roc_auc_score
+from sklearn.metrics import confusion_matrix, recall_score, roc_auc_score, roc_curve
+from sklearn.preprocessing import label_binarize
 from torch.utils.data import Dataset, DataLoader
 
 class ModifiedNN(nn.Module):
@@ -96,7 +99,7 @@ def balanced_accuracy(y_true, y_pred):
 
     return mean_recall, recall_per_class
 
-def per_category_auc(y_true, y_pred_prob, num_classes):
+def per_class_auc(y_true, y_pred_prob, num_classes):
     y_true_np = y_true
     y_true_one_hot = np.eye(num_classes)[y_true_np]
     auc_scores = []
@@ -144,20 +147,35 @@ def eval(models, device, test_loader):
 
     acc = accuracy(y_true, y_pred) * 100
     balanced_acc, per_class_accuracy = balanced_accuracy(y_true, y_pred)
-    category_auc = per_category_auc(y_true, y_pred_prob, num_classes=len(torch.unique(torch.tensor(y_true))))
+    num_classes = len(torch.unique(torch.tensor(y_true)))
+    per_class_auc = per_class_auc(y_true, y_pred_prob, num_classes=num_classes)
+    
+    fpr = dict()
+    tpr = dict()
+    # Binarize the true labels
+    y_true_bin = label_binarize(y_true, classes=np.arange(num_classes))
+    for i in range(num_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_pred_prob[:, i])
+
     cm = confusion_matrix(y_true, y_pred)
 
     print('\nTest set:  Accuracy: ({:.0f}%), Balanced Accuracy: {:.4f}, Recall for each Class: {}, AUC for each category: {}, Confusion Matrix: {}\n'.format(
         acc,
         balanced_acc,
         per_class_accuracy,
-        category_auc,
+        per_class_auc,
         cm
     ))
 
-    np.savetxt('confusion_matrix.csv', cm, delimiter=',')
-
-    return acc, balanced_acc, per_class_accuracy, category_auc
+    result = {}
+    result['accuracy'] = acc
+    result['balanced_accuracy'] = balanced_acc
+    result['per_class_accuracy'] = per_class_accuracy
+    result['per_class_auc'] = per_class_auc
+    result['confusion_matrix'] = cm
+    result['fpr'] = fpr
+    result['tpr'] = tpr
+    return result
 
 
 
@@ -181,6 +199,7 @@ def main():
     device = torch.device("cuda" if use_cuda else "cpu")
 
     model_list = [] 
+    model_name_list = []
     with open(modelList, 'r') as f:
         for line in f:
             model_name = line.strip()
@@ -222,7 +241,22 @@ def main():
                 exit(1)
             model = model.to(device)
             model_list.append(model)
-    eval(model_list, device, test_loader)
+            model_name_list.append(model_name)
+    result_dict = eval(model_list, device, test_loader)
+    result_dict['model_names'] = model_name_list
+
+    # Convert the list of strings into a single string
+    combined_string = ''.join(model_name_list)
+
+    # Create a hash of the combined string using hashlib
+    hash_object = hashlib.sha256(combined_string.encode('utf-8'))
+    hash_hex = hash_object.hexdigest() % 100
+
+    # Save the dictionary to a JSON file
+    with open(f'result_{hash_hex}.json', 'w') as f:
+        json.dump(result_dict, f)
+
+
 
     
 
