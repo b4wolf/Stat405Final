@@ -18,7 +18,6 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 from sklearn.metrics import roc_auc_score
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # Functions to calculate accuracy and balanced accuracy
 def accuracy(y_true, y_pred):
     y_true = torch.tensor(y_true)
@@ -153,20 +152,6 @@ def train(args, model, device, train_loader, criterion, optimizer, epoch):
 
 
     return epoch_loss
-    # # Evaluate the model on the validation set
-    # model.eval()
-    # valid_loss = 0.0
-    # with torch.no_grad():
-    #     for inputs, metadata, labels in valid_loader:
-    #         inputs, labels = inputs.to(device), labels.to(device)
-    #         inputs = inputs.to(device, dtype=weight_dtype)
-    #         outputs = model(inputs, metadata)
-    #         loss = criterion(outputs, labels)
-
-    #         valid_loss += loss.item()
-
-    #     valid_loss = valid_loss / len(valid_loader)
-    #     print(f"Validation Loss: {valid_loss:.4f}")
 
 
 def test(args, model, device, criterion, test_loader):
@@ -210,7 +195,7 @@ def test(args, model, device, criterion, test_loader):
         category_auc
     ))
 
-    return test_loss
+    return test_loss, balanced_acc
 
 
 def preprocess(data_dir_path, metadata_csv_path, model_name=''):
@@ -324,23 +309,36 @@ def main():
 
     kwargs = {'num_workers': 0, 'pin_memory': True} if use_cuda else {}
     model_name = args.model
-   
     train_set = preprocess("training_set", "HAM10000_metadata.csv", model_name)
     test_set = preprocess("testing_set", "HAM10000_test_metadata.csv", model_name)
 
+
     data_augmentation = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.RandomHorizontalFlip(),
+        transforms.Resize((600, int(400 * 1.25))),
+        transforms.RandomResizedCrop(
+            size=224,
+            scale=(0.8, 1.0),
+            ratio=(1.0, 1.0)
+        ),
         transforms.RandomChoice([
             transforms.RandomRotation(0),
             transforms.RandomRotation(90),
             transforms.RandomRotation(180),
             transforms.RandomRotation(270)
         ]),
+        transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=(0.9, 1.1), contrast=(0.9, 1.1), saturation=(0.9, 1.1)),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.7635, 0.5461, 0.5705], std=[0.0896, 0.1183, 0.1330]),
     ])
-    # train_set.data_augmentation = data_augmentation
+    train_set.data_augmentation = data_augmentation
+    test_set_preprocess = transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.7635, 0.5461, 0.5705], std=[0.0896, 0.1183, 0.1330]),
+    ])
+    test_set.preprocess(test_set_preprocess)
+    
     num_samples_per_class = np.zeros(7)
     for label in train_set.labels:
         num_samples_per_class[label] += 1
@@ -348,12 +346,10 @@ def main():
     num_samples_per_class_inversed = 1 / num_samples_per_class
     weighted_arr = num_samples_per_class_inversed / np.sum(num_samples_per_class_inversed)
     weighted_tensor = torch.from_numpy(weighted_arr.astype('float32')).to(device)
-    print(weighted_tensor)
 
     # Create DataLoaders for training and validation sets
     train_loader = DataLoader(train_set, batch_size= args.batch_size, shuffle=True, **kwargs)
     test_loader = DataLoader(test_set, batch_size=args.test_batch_size, shuffle=True, **kwargs)
-
 
     if model_name == 'resnet-50':
         weights = models.ResNet50_Weights.DEFAULT
@@ -390,33 +386,32 @@ def main():
         saved_model_state = torch.load(saved_model_name)
         model.load_state_dict(saved_model_state)
         
-
-    train_set.preprocess(model.transform)
-    test_set.preprocess(model.transform)
-    
     model = model.to(device)
     criterion = nn.CrossEntropyLoss(weight=weighted_tensor)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
-    # scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
 
+
+    test_loss, mean_recall = test(args, model, device, criterion, test_loader)
     last_train_loss = float('inf')
-    best_test_loss = float('inf')
+    best_mean_recall = mean_recall
     train_loss_history = []
     test_loss_history = []
+    mean_recall_history = []
     convg_counter = 0
     overfit_counter = 0
-    patience = 90
+    patience = 60
     for epoch in range(1, args.epochs + 1):
         train_loss = train(args, model, device, train_loader, criterion, optimizer, epoch)
-        test_loss = test(args, model, device, criterion, test_loader)
-        # scheduler.step()
+        test_loss, mean_recall = test(args, model, device, criterion, test_loader)
+        scheduler.step()
         if abs(train_loss - last_train_loss) < 0.001:
             convg_counter += 1
         else:
             convg_counter = 0
         last_train_loss = train_loss
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
+        if mean_recall > best_mean_recall:
+            best_mean_recall = mean_recall
             torch.save(model.state_dict(), saved_model_name)
             overfit_counter = 0
         else:
@@ -424,11 +419,13 @@ def main():
         
         train_loss_history.append(train_loss)
         test_loss_history.append(test_loss)
+        mean_recall_history.append(mean_recall)
         if convg_counter > patience or overfit_counter > patience:
             print(f"Early stopping after {epoch} epochs, convg: {convg_counter}, overfit: {overfit_counter}")
             break
     print(train_loss_history)
     print(test_loss_history)
+    print(mean_recall_history)
 
 if __name__ == '__main__':
     main()
