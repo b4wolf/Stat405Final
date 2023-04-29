@@ -2,7 +2,7 @@ universe = vanilla
 executable = pytorch_conda_cnn.sh
 arguments = "convnext"
 
-transfer_input_files = pytorch_conda_cnn.sh, environment.yml, main.py, training_set.pt, testing_set.pt
+transfer_input_files = pytorch_conda_cnn.sh, environment.yml, train.py, training_set.pt, testing_set.pt
 should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
 

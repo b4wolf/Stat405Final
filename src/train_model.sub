@@ -1,8 +1,8 @@
 universe = vanilla
-executable = pytorch_conda_cnn.sh
+executable = train.sh
 arguments = $(model)
 
-transfer_input_files = pytorch_conda_cnn.sh, environment.yml, main.py, training_set.pt, testing_set.pt
+transfer_input_files = train.sh, environment.yml, train.py, training_set.pt, testing_set.pt
 should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
 
