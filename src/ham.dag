@@ -1,4 +1,4 @@
-job 1 train_model.sub
+job 1 train.sub
 job 2 eval.sub
 
 PARENT 1 CHILD 2
