@@ -1,0 +1,17 @@
+universe = vanilla
+executable = preprocess.sh
+arguments = $(model)
+
+transfer_input_files = preprocess.sh, preprocess.py, dataset.py, environment_preprocess.yml
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+request_cpus = 1
+request_memory = 80GB
+request_disk = 40GB
+
+log = log/preprocess_$(Cluster)_$(Process).log
+error = error/preprocess_$(Cluster)_$(Process).err
+output = output/preprocess_$(Cluster)_$(Process).out
+
+queue 1

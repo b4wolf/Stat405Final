@@ -9,124 +9,14 @@ import numpy as np
 import math
 import torch.nn.functional as F
 
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import StepLR
 from torchvision import transforms
 from torchvision import models
-from torchvision.models import resnet50, resnet152, ResNet50_Weights, ResNet152_Weights, swin_v2_b, Swin_V2_B_Weights, convnext_base, ConvNeXt_Base_Weights
-from torch.utils.data import Dataset, DataLoader, random_split
-
 from PIL import Image
-from sklearn.metrics import roc_auc_score
-
-# Functions to calculate accuracy and balanced accuracy
-def accuracy(y_true, y_pred):
-    y_true = torch.tensor(y_true)
-    y_pred = torch.tensor(y_pred)
-    correct = torch.sum(y_true == y_pred).item()
-    total = y_true.shape[0]
-    return correct / total
-
-def balanced_accuracy(y_true, y_pred):
-    y_true = torch.tensor(y_true)
-    y_pred = torch.tensor(y_pred)
-    num_classes = torch.unique(y_true).size(0)
-    per_class_accuracies = []
-
-    for i in range(num_classes):
-        true_class = y_true == i
-        pred_class = y_pred == i
-        correct = torch.sum(true_class & pred_class).item()
-        per_class_accuracies.append(correct / torch.sum(true_class).item())
-    print(per_class_accuracies)
-
-    return sum(per_class_accuracies) / num_classes
-
-def per_category_auc(y_true, y_pred_prob, num_classes):
-    y_true_np = y_true
-    y_true_one_hot = np.eye(num_classes)[y_true_np]
-    auc_scores = []
-
-    for i in range(num_classes):
-        try:
-            auc = roc_auc_score(y_true_one_hot[:, i], y_pred_prob[:, i])
-            auc_scores.append(auc)
-        except ValueError:
-            pass
-
-    return auc_scores
-
-class ModifiedNN(nn.Module):
-    def __init__(self):
-        super(ModifiedNN, self).__init__()
-
-    def forward(self, x, metadata):
-        x = self.model(x)
-        x = x.view(x.size(0), -1)
-        x = torch.cat((x, metadata), dim=1)
-        x = self.fc(x)
-        return x
-    
-class ModifiedResNet(ModifiedNN):
-    def __init__(self, resnet, transform, metadata_size):
-        super(ModifiedResNet, self).__init__()
-        self.model = nn.Sequential(*list(resnet.children())[:-1])
-        self.fc = nn.Linear(resnet.fc.in_features + metadata_size, 7)
-        self.transform = transform
-
-
-class ModifiedSwinTransformer(ModifiedNN):
-    def __init__(self, swin_transformer, transform, metadata_size):
-        super(ModifiedSwinTransformer, self).__init__()
-        self.model = nn.Sequential(*list(swin_transformer.children())[:-1])
-        self.fc = nn.Linear(swin_transformer.head.in_features + metadata_size, 7)
-        self.transform = transform
-
-class ModifiedConvNext(ModifiedNN):
-    def __init__(self, convnext, transform, metadata_size):
-        super(ModifiedConvNext, self).__init__()
-        self.model = nn.Sequential(*list(convnext.children())[:-1])
-        self.fc = nn.Linear(convnext.classifier[-1].in_features + metadata_size, 7)
-        self.transform = transform
-
-# Define a custom dataset to handle images and metadata
-class PreloadedImagesDataset(Dataset):
-    def __init__(self, images, metadata, labels):
-        self.images = images
-        self.metadata = metadata
-        self.labels = labels
-        self.data_augmentation = None
-    
-    def fill_missing_values_with_static(self, fill_value):
-        metadata_arr = np.array(self.metadata, dtype=np.float32)
-        metadata_arr[np.isnan(metadata_arr)] = fill_value
-        self.metadata = metadata_arr
-    
-    def normalize_age(self):
-        age = self.metadata[:, 5]
-        self.metadata[:, 5] = age / 100
-    
-    def fill_missing_values_with_mean(self):
-        metadata_arr = np.array(self.metadata, dtype=np.float32)
-        self.metadata = metadata_arr
-        age = self.metadata[:, 5]
-        age_mean = np.nanmean(age)
-        age[np.isnan(age)] = age_mean
-        self.metadata[:, 5] = age
-
-    def preprocess(self, preprocess):
-        for idx, img in enumerate(self.images):
-            self.images[idx] = preprocess(img)
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        if self.data_augmentation is not None:
-            image = self.data_augmentation(self.images[idx])
-        else:
-            image = self.images[idx]
-        return image, self.metadata[idx], self.labels[idx]
-
+from dataset import PreloadedImagesDataset
+from modified_model import ModifiedResNet, ModifiedConvNext, ModifiedSwinTransformer
+from utils import accuracy, balanced_accuracy, class_auc
 
 
 def train(args, model, device, train_loader, criterion, optimizer, epoch):
@@ -157,7 +47,7 @@ def train(args, model, device, train_loader, criterion, optimizer, epoch):
 def test(args, model, device, criterion, test_loader):
     model.eval()
     test_loss = 0
-    correct = 0
+    # correct = 0
 
     y_true_list = []
     y_pred_list = []
@@ -172,8 +62,6 @@ def test(args, model, device, criterion, test_loader):
             pred_prob = torch.softmax(output, dim=1)  # get the predicted probabilities
             pred = pred_prob.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
 
-            correct += pred.eq(target.view_as(pred)).sum().item()
-
             y_true_list.extend(target.cpu().numpy())
             y_pred_list.extend(pred.squeeze().cpu().numpy())
             y_pred_prob_list.extend(pred_prob.cpu().numpy())
@@ -184,78 +72,29 @@ def test(args, model, device, criterion, test_loader):
     y_pred = np.array(y_pred_list)
     y_pred_prob = np.array(y_pred_prob_list)
 
-    # acc = accuracy(y_true, y_pred) * 100
-    balanced_acc = balanced_accuracy(y_true, y_pred)
-    category_auc = per_category_auc(y_true, y_pred_prob, num_classes=len(torch.unique(torch.tensor(y_true))))
+    acc = accuracy(y_true, y_pred) * 100
+    balanced_acc, per_class_acc = balanced_accuracy(y_true, y_pred)
+    per_class_auc = class_auc(y_true, y_pred_prob, num_classes=len(torch.unique(torch.tensor(y_true))))
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%), Balanced Accuracy: {:.4f}, AUC for each category: {}\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset),
+    print('\nTest set:  Test_loss: {:.0f}, Accuracy: ({:.0f}%), Balanced Accuracy: {:.4f}, Recall for each Class: {}, AUC for each category: {}\n'.format(
+        test_loss,
+        acc,
         balanced_acc,
-        category_auc
+        per_class_acc,
+        per_class_auc,
     ))
 
     return test_loss, balanced_acc
 
 
-def preprocess(data_dir_path, metadata_csv_path, model_name=''):
-    saved_image_data_name = f"{data_dir_path}.pt"
-    if os.path.exists(saved_image_data_name):
-        dataset = torch.load(saved_image_data_name)
+def load_dataset(dataset_name):
+    saved_dataset_image = f"{dataset_name}.pt"
+    if os.path.exists(saved_dataset_image):
+        dataset = torch.load(saved_dataset_image)
     else:   
-        metadata_df = pd.read_csv(metadata_csv_path)
+        print("Dataset not exits")
+        exit(1)      
 
-        metadata_df = metadata_df[['image_id', 'dx', 'dx_type', 'age', 'sex', 'localization', 'dataset']]
-        metadata_dict = {row['image_id']: row[1:].tolist() for _, row in metadata_df.iterrows()}
-        metadata_transposed = list(zip(*metadata_df.values.tolist()))
-        mapping_list = [None, {'bcc': 0, 'vasc': 1, 'df': 2, 'bkl': 3, 'akiec': 4, 'mel': 5, 'nv': 6}, 
-                        {'confocal': 0, 'follow_up': 1, 'consensus': 2, 'histo': 3}, 
-                        {}, 
-                        {'male': 0, 'female': 1, 'unknown': 2}, 
-                        {'scalp': 0, 'face': 1, 'ear': 2, 'acral': 3, 'back': 4, 'foot': 5, 'lower extremity': 6, 'genital': 7, 'neck': 8, 'upper extremity': 9, 'hand': 10, 'chest': 11, 'unknown': 12, 'trunk': 13, 'abdomen': 14}, 
-                        {'vienna_dias': 0, 'rosendahl': 1, 'vidir_molemax': 2, 'vidir_modern': 3, 'external': 4}]
-        # Map the metadata using the corresponding dictionary for each column (except the first one) and list comprehensions
-        mapped_metadata_transposed = [metadata_transposed[0]]  # Keep the first column (image_id) unchanged
-        for column, mapping in zip(metadata_transposed[1:], mapping_list[1:]):
-            mapped_column = [mapping.get(x, x) for x in column]
-            mapped_metadata_transposed.append(mapped_column)
-
-        # Transpose the mapped metadata back to the original shape
-        metadata_int = list(zip(*mapped_metadata_transposed))
-        metadata_dict = {row[0]: row[1:] for row in metadata_int}
-        label_list = []
-        image_list = []
-        metadata_list = []
-        for idx, image_filename in enumerate(os.listdir(data_dir_path)):
-            if image_filename.startswith("ISIC"):
-                image_id = os.path.splitext(image_filename)[0]
-                image_path = os.path.join(data_dir_path, image_filename)
-                image = Image.open(image_path).convert('RGB')
-                image_list.append(image)
-                metadata = metadata_dict.get(image_id)
-
-                metadata_one_hot = []
-
-                for meta_idx, x in enumerate(metadata[1:]):
-                    if meta_idx != 1:
-                        class_num = len(mapping_list[2+meta_idx])
-                        if math.isnan(x):
-                            x = class_num
-                        one_hot_expression = F.one_hot(torch.tensor([x]), num_classes=class_num + 1).tolist()
-                        metadata_one_hot.extend(one_hot_expression[0])
-                    else:
-                        metadata_one_hot.append(x)
-
-                metadata_list.append(metadata_one_hot)
-                label_list.append(metadata[0])
-                if idx % 1000 == 0:
-                    print(f"loaded {idx} images")
-
-        # Create custom dataset and dataloader
-        dataset = PreloadedImagesDataset(image_list, metadata_list, label_list)
-        torch.save(dataset, saved_image_data_name)      
-
-    
     dataset.fill_missing_values_with_mean()
     dataset.normalize_age()
     return dataset
@@ -278,10 +117,7 @@ def main():
                         help='random seed (default: 1)')
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
-    
-    parser.add_argument('--mode', type=str, default='all', metavar='MO', help='what is the mode to run this script? <all|preprocess>')
-    
-    parser.add_argument('--dataset', type=str, default='')
+
 
     parser.add_argument('--model', type=str, default='resnet-152', metavar='MD',
                         help='Which model to train')
@@ -291,13 +127,6 @@ def main():
     
     
     args = parser.parse_args()
-    if args.mode == 'preprocess':
-        if args.dataset.startswith('training_set'):
-            preprocess(args.dataset, "HAM10000_metadata.csv", model_name='')
-        elif args.dataset.startswith('testing_set'):
-            preprocess(args.dataset, "HAM10000_test_metadata.csv", model_name='')
-
-        return
  
     if (not torch.cuda.is_available()):
         raise OSError("Torch cannot find a cuda device")
@@ -309,8 +138,8 @@ def main():
 
     kwargs = {'num_workers': 0, 'pin_memory': True} if use_cuda else {}
     model_name = args.model
-    train_set = preprocess("training_set", "HAM10000_metadata.csv", model_name)
-    test_set = preprocess("testing_set", "HAM10000_test_metadata.csv", model_name)
+    train_set = load_dataset("training_set")
+    test_set = load_dataset("testing_set")
 
 
     data_augmentation = transforms.Compose([
@@ -399,29 +228,25 @@ def main():
     test_loss_history = []
     mean_recall_history = []
     convg_counter = 0
-    overfit_counter = 0
     patience = 60
     for epoch in range(1, args.epochs + 1):
         train_loss = train(args, model, device, train_loader, criterion, optimizer, epoch)
         test_loss, mean_recall = test(args, model, device, criterion, test_loader)
         scheduler.step()
-        if abs(train_loss - last_train_loss) < 0.001:
+        if abs(train_loss - last_train_loss) < 0.01:
             convg_counter += 1
         else:
             convg_counter = 0
         last_train_loss = train_loss
         if mean_recall > best_mean_recall:
             best_mean_recall = mean_recall
-            torch.save(model.state_dict(), saved_model_name)
-            overfit_counter = 0
-        else:
-            overfit_counter += 1
-        
+            torch.save(model.state_dict(),  saved_model_name)
+
         train_loss_history.append(train_loss)
         test_loss_history.append(test_loss)
         mean_recall_history.append(mean_recall)
-        if convg_counter > patience or overfit_counter > patience:
-            print(f"Early stopping after {epoch} epochs, convg: {convg_counter}, overfit: {overfit_counter}")
+        if convg_counter > patience:
+            print(f"Early stopping after {epoch} epochs, convg: {convg_counter}")
             break
     print(train_loss_history)
     print(test_loss_history)

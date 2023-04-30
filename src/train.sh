@@ -5,9 +5,6 @@ echo 'Host: ' `hostname`
 echo 'System: ' `uname -spo` 
 echo 'GPU: ' `lspci | grep NVIDIA`
 
-# Prepare the dataset
-# tar xvf HAM10000.tar.gz
-# tar xvf HAM10000_test.tar.gz
 
 # Following the example from http://chtc.cs.wisc.edu/conda-installation.shtml
 # except here we download the installer instead of transferring it

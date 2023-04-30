@@ -2,7 +2,7 @@ universe = vanilla
 executable = train.sh
 arguments = $(model)
 
-transfer_input_files = train.sh, environment.yml, train.py, training_set.pt, testing_set.pt
+transfer_input_files = train.sh, environment.yml, train.py, utils.py, dataset.py, modified_model.py, training_set.pt, testing_set.pt
 should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
 

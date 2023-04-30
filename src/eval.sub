@@ -2,7 +2,7 @@ universe = vanilla
 executable = eval.sh
 arguments = evalModelList
 
-transfer_input_files = eval.sh, environment.yml, eval.py, testing_set.pt, ham_convnext-l.pt, ham_swin-b.pt, ham_resnet-152.pt, evalModelList
+transfer_input_files = eval.sh, environment.yml, eval.py, utils.py, dataset.py, modified_model.py, testing_set.pt, ham_convnext-l.pt, ham_swin-b.pt, ham_resnet-152.pt, evalModelList, ham_convnext-b.pt, ham_resnet-50.pt, ham_swin-s.pt
 should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
 

@@ -1,7 +1,10 @@
-job 1 train.sub
-job 2 eval.sub
+job 1 preprocess.sub
+job 2 train.sub
+job 3 eval.sub
 
 PARENT 1 CHILD 2
+PARENT 2 CHILD 3
+
 
 
 
