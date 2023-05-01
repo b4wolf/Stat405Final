@@ -1,9 +1,9 @@
 #!/bin/bash
 
-echo 'Date: ' `date` 
-echo 'Host: ' `hostname` 
-echo 'System: ' `uname -spo` 
-echo 'GPU: ' `lspci | grep NVIDIA`
+# echo 'Date: ' `date` 
+# echo 'Host: ' `hostname` 
+# echo 'System: ' `uname -spo` 
+# echo 'GPU: ' `lspci | grep NVIDIA`
 
 
 # Following the example from http://chtc.cs.wisc.edu/conda-installation.shtml
@@ -30,4 +30,4 @@ conda list
 
 # Modify these lines to run your desired Python script
 python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'PyTorch CUDA version: {torch.version.cuda}'); print(f'CUDA device: {torch.cuda.get_device_name(0)}')"
-python train.py --save-model --epochs 120 --lr 0.001 --momentum 0.9 --test-batch-size 64 --model $1
+python train.py --save-model --epochs 60 --lr 0.001 --momentum 0.9 --test-batch-size 64 --model $1

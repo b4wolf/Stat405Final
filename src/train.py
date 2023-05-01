@@ -76,7 +76,7 @@ def test(args, model, device, criterion, test_loader):
     balanced_acc, per_class_acc = balanced_accuracy(y_true, y_pred)
     per_class_auc = class_auc(y_true, y_pred_prob, num_classes=len(torch.unique(torch.tensor(y_true))))
 
-    print('\nTest set:  Test_loss: {:.0f}, Accuracy: ({:.0f}%), Balanced Accuracy: {:.4f}, Recall for each Class: {}, AUC for each category: {}\n'.format(
+    print('\nTest set:  Test_loss: {:.6f}, Accuracy: ({:.0f}%), Balanced Accuracy: {:.4f}, Recall for each Class: {}, AUC for each category: {}\n'.format(
         test_loss,
         acc,
         balanced_acc,
@@ -162,7 +162,12 @@ def main():
     ])
     train_set.data_augmentation = data_augmentation
     test_set_preprocess = transforms.Compose([
-        transforms.Resize(224),
+        transforms.Resize((600, int(400 * 1.25))),
+        transforms.RandomResizedCrop(
+            size=224,
+            scale=(0.95, 1.0),
+            ratio=(1.0, 1.0)
+        ),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.7635, 0.5461, 0.5705], std=[0.0896, 0.1183, 0.1330]),
     ])

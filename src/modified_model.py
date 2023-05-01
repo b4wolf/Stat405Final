@@ -31,5 +31,6 @@ class ModifiedConvNext(ModifiedNN):
     def __init__(self, convnext, transform, metadata_size):
         super(ModifiedConvNext, self).__init__()
         self.model = nn.Sequential(*list(convnext.children())[:-1])
-        self.fc = nn.Linear(convnext.classifier[-1].in_features + metadata_size, 7)
+        in_features = convnext.classifier[-1].in_features + metadata_size
+        self.fc = nn.Linear(in_features, 7)
         self.transform = transform

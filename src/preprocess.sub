@@ -1,6 +1,5 @@
 universe = vanilla
 executable = preprocess.sh
-arguments = $(model)
 
 transfer_input_files = preprocess.sh, preprocess.py, dataset.py, environment_preprocess.yml
 should_transfer_files = YES

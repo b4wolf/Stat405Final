@@ -17,6 +17,7 @@ from utils import accuracy, balanced_accuracy, class_auc
 
 def ensemble_prediction(models, img, metadata):
     pred = []
+    weighted = torch.tensor([0.0857, 0.2, 0.20, 0.0401, 0.1347, 0.05, 0.01]).to('cuda')
     for model in models:
         model.eval()
         output = model(img, metadata)
@@ -85,7 +86,12 @@ def main():
     modelList = sys.argv[1]
     test_set = torch.load('testing_set.pt')
     test_set_preprocess = transforms.Compose([
-            transforms.Resize(224),
+            transforms.Resize((600, int(400 * 1.25))),
+            transforms.RandomResizedCrop(
+                size=224,
+                scale=(0.95, 1.0),
+                ratio=(1.0, 1.0)
+            ),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.7635, 0.5461, 0.5705], std=[0.0896, 0.1183, 0.1330]),
         ])
